@@ -8,7 +8,7 @@ echo "==> [1/6] Building universal helper binaries (device_helper & airtraffic_h
 make clean
 make all
 
-APP_NAME="AirCard"
+APP_NAME="AirCardManager"
 APP_DIR="build/${APP_NAME}.app"
 CONTENTS_DIR="${APP_DIR}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
@@ -29,23 +29,23 @@ cat << 'EOF' > "${CONTENTS_DIR}/Info.plist"
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleExecutable</key>
-    <string>AirCard</string>
+    <string>AirCardManager</string>
     <key>CFBundleIdentifier</key>
-    <string>com.mak5er.aircard</string>
+    <string>com.williamwang.aircardmanager</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>AirCard</string>
+    <string>AirCard Manager</string>
     <key>CFBundleDisplayName</key>
-    <string>AirCard</string>
+    <string>AirCard Manager</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.2.4</string>
+    <string>0.1.0</string>
     <key>CFBundleVersion</key>
-    <string>7</string>
+    <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
     <key>NSHighResolutionCapable</key>
@@ -91,10 +91,11 @@ if [ -z "${SWIFT_SDK:-}" ]; then
         SWIFT_SDK="$CLT_SWIFTUI_SDK"
     fi
 fi
-swiftc -sdk "$SWIFT_SDK" -O -parse-as-library -target arm64-apple-macosx14.0 AirCardApp.swift -o build/AirCard_arm64
-swiftc -sdk "$SWIFT_SDK" -O -parse-as-library -target x86_64-apple-macosx14.0 AirCardApp.swift -o build/AirCard_x86_64
-lipo -create -output "${MACOS_DIR}/AirCard" build/AirCard_arm64 build/AirCard_x86_64
-chmod +x "${MACOS_DIR}/AirCard"
+SWIFT_SOURCES=(AirCardApp.swift ManagerStore.swift SkinLibraryView.swift)
+swiftc -sdk "$SWIFT_SDK" -O -parse-as-library -target arm64-apple-macosx14.0 "${SWIFT_SOURCES[@]}" -o build/AirCard_arm64
+swiftc -sdk "$SWIFT_SDK" -O -parse-as-library -target x86_64-apple-macosx14.0 "${SWIFT_SOURCES[@]}" -o build/AirCard_x86_64
+lipo -create -output "${MACOS_DIR}/${APP_NAME}" build/AirCard_arm64 build/AirCard_x86_64
+chmod +x "${MACOS_DIR}/${APP_NAME}"
 
 echo "==> [5/6] Setting permissions and signing ${APP_NAME}.app bundle..."
 chmod -R 755 "$APP_DIR"
@@ -109,24 +110,34 @@ cp -R "$APP_DIR" "$DMG_STAGING/"
 
 rm -f "build/${APP_NAME}.dmg"
 
+# create-dmg 是个 Node 工具，它的 macos-alias 原生模块在某些机器上装不上；
+# 装不上就退回 hdiutil 生成一个朴素但可用的 DMG，别让打包步骤整个失败。
+styled_dmg_ok=0
 if command -v create-dmg >/dev/null 2>&1; then
-    create-dmg \
-        --volname "AirCard" \
+    if create-dmg \
+        --volname "${APP_NAME}" \
         --background "dmg_assets/background_700.png" \
         --window-pos 200 120 \
         --window-size 700 460 \
         --icon-size 110 \
-        --icon "AirCard.app" 175 220 \
-        --hide-extension "AirCard.app" \
+        --icon "${APP_NAME}.app" 175 220 \
+        --hide-extension "${APP_NAME}.app" \
         --app-drop-link 525 220 \
         --add-file "README.txt" "dmg_assets/README.txt" 350 360 \
         --filesystem APFS \
         --overwrite \
         "build/${APP_NAME}.dmg" \
-        "$DMG_STAGING"
-else
-    ln -s /Applications "$DMG_STAGING/Applications"
-    hdiutil create -volname "AirCard" -srcfolder "$DMG_STAGING" -ov -format UDZO "build/${APP_NAME}.dmg"
+        "$DMG_STAGING"; then
+        styled_dmg_ok=1
+    else
+        echo "    ⚠️  create-dmg 执行失败，回退到 hdiutil。"
+    fi
+fi
+
+if [ "$styled_dmg_ok" -eq 0 ]; then
+    rm -f "build/${APP_NAME}.dmg"
+    ln -sfn /Applications "$DMG_STAGING/Applications"
+    hdiutil create -volname "${APP_NAME}" -srcfolder "$DMG_STAGING" -ov -format UDZO "build/${APP_NAME}.dmg"
 fi
 
 echo "============================================================"

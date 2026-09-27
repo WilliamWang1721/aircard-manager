@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 import UniformTypeIdentifiers
 
 // MARK: - Models
@@ -22,6 +23,10 @@ struct CardItem: Identifiable, Hashable {
     var isSelected: Bool = true
     var customImageURL: URL? = nil
     var customImage: NSImage? = nil
+    /// 卡面库中的素材 id，nil 表示这张卡还没分配卡面。
+    var skinId: UUID? = nil
+    /// 用户起的中文名，例如「招行 Y-Club」。
+    var nickname: String = ""
     
     func hash(into hasher: inout Hasher) {
         hasher.combine(id)
@@ -29,10 +34,20 @@ struct CardItem: Identifiable, Hashable {
     
     static func == (lhs: CardItem, rhs: CardItem) -> Bool {
         lhs.id == rhs.id && lhs.isSelected == rhs.isSelected && lhs.customImageURL == rhs.customImageURL
+            && lhs.skinId == rhs.skinId && lhs.nickname == rhs.nickname
     }
 }
 
+/// 一次刷写任务：卡 hash + 要写入的图片。正常分配和历史回滚走同一条通道。
+struct SkinFlashJob: Sendable {
+    let cardHash: String
+    let imageURL: URL
+    let skinName: String
+    let skinId: UUID?
+}
+
 enum AppTab: String, CaseIterable, Identifiable {
+    case skinLibrary = "卡面库"
     case walletCards = "Apple Wallet"
     case passcodeThemes = "Passcode (.passthm)"
     var id: String { rawValue }
@@ -487,6 +502,10 @@ class AppViewModel: ObservableObject {
     @Published var isScanningCards = false
     @Published var cards: [CardItem] = []
     
+    /// 卡面库：素材、卡别名、卡↔卡面分配、应用历史都存在这一层。
+    let manager = ManagerStore.shared
+    private var managerObserver: AnyCancellable?
+    
     @Published var isFlashing = false
     @Published var progress: Double = 0.0
     @Published var statusText: String = "Ready"
@@ -518,6 +537,10 @@ class AppViewModel: ObservableObject {
             self.scriptDir = cwd
         } else {
             self.scriptDir = Bundle.main.bundleURL.deletingLastPathComponent().path
+        }
+        
+        managerObserver = manager.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
         }
         
         loadSavedCards()
@@ -657,11 +680,25 @@ class AppViewModel: ObservableObject {
         ]
         loaded.removeAll { dummyHashes.contains($0) || ($0.contains("-") && $0.count == 36) }
         
-        self.cards = loaded.map { CardItem(id: $0, isSelected: true) }
-        log("Loaded \(cards.count) real card(s) from storage.")
+        // 卡面库可能已含上游旧版或其它途径记下的卡，一并接上。
+        for hash in manager.cards.keys where !loaded.contains(hash) && ManagerStore.looksLikeCardHash(hash) {
+            loaded.append(hash)
+        }
+        
+        self.cards = loaded.map { hash in
+            let profile = manager.ensureCard(hash)
+            let asset = manager.asset(id: profile.assignedSkinId)
+            return CardItem(id: hash,
+                            isSelected: true,
+                            customImageURL: asset.map { manager.url(for: $0) },
+                            customImage: asset.flatMap { NSImage(contentsOf: manager.url(for: $0)) },
+                            skinId: asset?.id,
+                            nickname: profile.nickname)
+        }
+        log("Loaded \(cards.count) card(s), \(cards.filter { $0.skinId != nil }.count) with a saved skin.")
     }
     
-    func saveCards() {
+    func saveCards(pruneMissing: Bool = true) {
         let hashes = cards.map { $0.id }
         UserDefaults.standard.set(hashes, forKey: storageKey)
         
@@ -669,6 +706,10 @@ class AppViewModel: ObservableObject {
         if let data = try? JSONEncoder().encode(hashes) {
             try? data.write(to: URL(fileURLWithPath: jsonPath), options: .atomic)
         }
+        
+        // 卡↔卡面的对应关系只有卡面库存得下来，上游这段从不保存它。
+        if pruneMissing { manager.pruneCards(keeping: Set(hashes)) }
+        manager.scheduleSave()
     }
     
     func addCardHash(_ raw: String) {
@@ -678,6 +719,7 @@ class AppViewModel: ObservableObject {
             let clean = comp.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "."))
             if clean.count >= 16 && clean.count <= 64 && !cards.contains(where: { $0.id == clean }) {
                 cards.append(CardItem(id: clean, isSelected: true))
+                manager.ensureCard(clean)
                 addedCount += 1
                 log("Added card: \(clean)")
             }
@@ -689,30 +731,68 @@ class AppViewModel: ObservableObject {
     
     func deleteCard(id: String) {
         cards.removeAll { $0.id == id }
-        saveCards()
+        manager.forgetCard(id)
+        saveCards(pruneMissing: false)
         log("Removed card: \(id)")
     }
     
+    /// 清空列表：卡和它的别名/记录一起出库，否则下次启动又被当作已知卡加载回来。
     func clearAllCards() {
         cards.removeAll()
-        saveCards()
+        UserDefaults.standard.set([], forKey: storageKey)
+        manager.pruneCards(keeping: [])
+        manager.scheduleSave()
         log("Cleared all cards.")
     }
     
+    /// 外部选图 / 拖图入口：先收进卡面库再分配，避免原图被移走后链接失效。
     func setCardImage(for cardId: String, url: URL) {
-        if let idx = cards.firstIndex(where: { $0.id == cardId }) {
+        guard let idx = cards.firstIndex(where: { $0.id == cardId }) else { return }
+        let summary = manager.importImages(from: [url])
+        if let assetId = summary.addedIds.last {
+            assignSkin(assetId, to: cardId)
+            log("Imported skin into library and assigned to card: \(cardId.prefix(12))...")
+        } else {
+            // 图片读不出字节时退回临时引用，本次会话仍可用，但明确告知无法持久化。
             cards[idx].customImageURL = url
             cards[idx].customImage = NSImage(contentsOf: url)
+            cards[idx].skinId = nil
             cards[idx].isSelected = true
-            log("Assigned custom skin to card: \(cardId.prefix(12))...")
+            manager.lastError = "这张图无法收进卡面库，只能本次临时使用。"
         }
     }
     
+    func assignSkin(_ skinId: UUID?, to cardId: String) {
+        guard let idx = cards.firstIndex(where: { $0.id == cardId }) else { return }
+        manager.assignSkin(skinId, to: cardId)
+        let asset = manager.asset(id: skinId)
+        cards[idx].skinId = asset?.id
+        cards[idx].customImageURL = asset.map { manager.url(for: $0) }
+        cards[idx].customImage = asset.flatMap { NSImage(contentsOf: manager.url(for: $0)) }
+        if asset != nil { cards[idx].isSelected = true }
+        saveCards()
+    }
+    
+    func setNickname(_ value: String, for cardId: String) {
+        guard let idx = cards.firstIndex(where: { $0.id == cardId }) else { return }
+        cards[idx].nickname = value
+        manager.setNickname(value, for: cardId)
+    }
+    
     func clearCardImage(for cardId: String) {
-        if let idx = cards.firstIndex(where: { $0.id == cardId }) {
-            cards[idx].customImageURL = nil
-            cards[idx].customImage = nil
-            log("Cleared custom skin for: \(cardId.prefix(12))...")
+        guard cards.contains(where: { $0.id == cardId }) else { return }
+        assignSkin(nil, to: cardId)
+        log("Cleared custom skin for: \(cardId.prefix(12))...")
+    }
+    
+    /// 素材被删时刷新卡片显示，避免继续展示已不存在的图。
+    func syncCardsWithLibrary() {
+        for idx in cards.indices {
+            let asset = manager.asset(id: manager.skinId(for: cards[idx].id))
+            cards[idx].skinId = asset?.id
+            cards[idx].customImageURL = asset.map { manager.url(for: $0) }
+            cards[idx].customImage = asset.flatMap { NSImage(contentsOf: manager.url(for: $0)) }
+            cards[idx].nickname = manager.cards[cards[idx].id]?.nickname ?? ""
         }
     }
     
@@ -964,34 +1044,58 @@ class AppViewModel: ObservableObject {
     // MARK: - Skin Application
     
     func applySkin() {
-        guard let udid = device?.udid else {
-            errorMessage = "No iPhone connected."
+        let jobs = cards.compactMap { card -> SkinFlashJob? in
+            guard card.isSelected, let url = card.customImageURL else { return nil }
+            let asset = manager.asset(id: card.skinId)
+            return SkinFlashJob(cardHash: card.id,
+                                imageURL: url,
+                                skinName: asset?.name ?? url.deletingPathExtension().lastPathComponent,
+                                skinId: asset?.id)
+        }
+        guard !jobs.isEmpty else {
+            errorMessage = "请给至少一张勾选中的卡分配卡面。"
             return
         }
-        let selectedCardsWithSkin = cards.filter { $0.isSelected && $0.customImageURL != nil }
-        guard !selectedCardsWithSkin.isEmpty else {
-            errorMessage = "Please assign a skin image to at least one selected card."
+        runFlashJobs(jobs)
+    }
+    
+    /// 回滚：把某张卡重刷成它历史上成功刷入过的另一张卡面。
+    func rollbackCard(_ cardHash: String, to asset: SkinAsset) {
+        guard manager.cards[cardHash] != nil else {
+            errorMessage = "这张卡不在当前列表里，无法回滚。"
+            return
+        }
+        assignSkin(asset.id, to: cardHash)
+        runFlashJobs([SkinFlashJob(cardHash: cardHash,
+                                   imageURL: manager.url(for: asset),
+                                   skinName: asset.name,
+                                   skinId: asset.id)])
+    }
+    
+    private func runFlashJobs(_ jobs: [SkinFlashJob]) {
+        guard let udid = device?.udid else {
+            errorMessage = "No iPhone connected."
             return
         }
         
         isFlashing = true
         showLogs = true
         progress = 0.0
-        log("Starting skin application for \(selectedCardsWithSkin.count) card(s)...")
+        log("Starting skin application for \(jobs.count) card(s)...")
         let scriptDir = self.scriptDir
         
         Task.detached {
             var flashFailed = false
-            let totalCards = Double(selectedCardsWithSkin.count)
-            for (idx, card) in selectedCardsWithSkin.enumerated() {
-                guard let imgURL = card.customImageURL else { continue }
+            let totalCards = Double(jobs.count)
+            for (idx, job) in jobs.enumerated() {
+                let imgURL = job.imageURL
                 
                 let preparedPath = "/tmp/aircard_prep_\(idx).png"
                 
                 await MainActor.run {
-                    self.statusText = "[\(idx + 1)/\(selectedCardsWithSkin.count)] Preparing skin for \(card.id.prefix(10))..."
+                    self.statusText = "[\(idx + 1)/\(jobs.count)] Preparing skin for \(job.cardHash.prefix(10))..."
                     self.progress = (Double(idx) + 0.05) / totalCards
-                    self.log("Flashing card [\(idx + 1)/\(selectedCardsWithSkin.count)]: \(card.id)")
+                    self.log("Flashing card [\(idx + 1)/\(jobs.count)]: \(job.cardHash)")
                 }
                 
                 // 1. Prepare image natively in Swift (0 external dependencies!)
@@ -1012,7 +1116,7 @@ class AppViewModel: ObservableObject {
                 flashProcess.executableURL = AppViewModel.pythonExecutableURL
                 flashProcess.environment = AppViewModel.processEnvironment
                 flashProcess.currentDirectoryURL = URL(fileURLWithPath: scriptDir)
-                flashProcess.arguments = ["aircard_backend.py", "--flash", udid, card.id, preparedPath]
+                flashProcess.arguments = ["aircard_backend.py", "--flash", udid, job.cardHash, preparedPath]
                 
                 let pipe = Pipe()
                 let errPipe = Pipe()
@@ -1056,7 +1160,7 @@ class AppViewModel: ObservableObject {
                             let currentProgress = (Double(idx) + subProgress) / totalCards
                             self.progress = min(currentProgress, 1.0)
                         }
-                        self.statusText = "[\(idx + 1)/\(selectedCardsWithSkin.count)] \(msg)"
+                        self.statusText = "[\(idx + 1)/\(jobs.count)] \(msg)"
                         self.log("  \(msg)")
                     }
                 }
@@ -1096,13 +1200,17 @@ class AppViewModel: ObservableObject {
                 if flashProcess.terminationStatus != 0 {
                     flashFailed = true
                     await MainActor.run {
-                        self.log("Card update failed for \(card.id.prefix(12))...")
+                        self.log("Card update failed for \(job.cardHash.prefix(12))...")
+                        self.manager.recordApply(cardHash: job.cardHash, skinId: job.skinId,
+                                                 skinName: job.skinName, succeeded: false)
                     }
                     break
                 }
                 
                 await MainActor.run {
                     self.progress = Double(idx + 1) / totalCards
+                    self.manager.recordApply(cardHash: job.cardHash, skinId: job.skinId,
+                                             skinName: job.skinName, succeeded: true)
                 }
             }
             
@@ -1447,10 +1555,27 @@ struct WalletCardView: View {
     let onPickImage: () -> Void
     let onClearImage: () -> Void
     let onDelete: () -> Void
+    /// 拖进来的图先入卡面库再分配，直接写 binding 会丢持久化。
+    let onDropImage: (URL) -> Void
+    let onShowHistory: () -> Void
     
     @State private var isHovered = false
     @State private var isTargeted = false
     @State private var copied = false
+    @State private var nicknameDraft = ""
+    
+    private var skinLabel: String {
+        guard let id = card.skinId else { return "未分配卡面" }
+        let name = ManagerStore.shared.asset(id: id)?.name ?? "素材已删除"
+        return "卡面：\(name)"
+    }
+    
+    private func commitNickname() {
+        let cleaned = nicknameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        nicknameDraft = cleaned
+        card.nickname = cleaned
+        ManagerStore.shared.setNickname(cleaned, for: card.id)
+    }
     
     var body: some View {
         VStack(spacing: 10) {
@@ -1575,24 +1700,17 @@ struct WalletCardView: View {
                         } else if let data = item as? Data, let urlStr = String(data: data, encoding: .utf8), let url = URL(string: urlStr) {
                             fileURL = url
                         }
-                        if let url = fileURL, let img = NSImage(contentsOf: url) {
-                            Task { @MainActor in
-                                card.customImageURL = url
-                                card.customImage = img
-                                card.isSelected = true
-                            }
+                        if let url = fileURL {
+                            Task { @MainActor in onDropImage(url) }
                         }
                     }
                     return true
                 } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
                     provider.loadItem(forTypeIdentifier: UTType.image.identifier, options: nil) { item, _ in
-                        if let url = item as? URL, let img = NSImage(contentsOf: url) {
-                            Task { @MainActor in
-                                card.customImageURL = url
-                                card.customImage = img
-                                card.isSelected = true
-                            }
+                        if let url = item as? URL {
+                            Task { @MainActor in onDropImage(url) }
                         } else if let img = item as? NSImage {
+                            // 拖入的位图没有文件路径，先落成 PNG 才能进卡面库。
                             let tempURL = FileManager.default.temporaryDirectory
                                 .appendingPathComponent("aircard_drop_\(UUID().uuidString).png")
                             if let tiff = img.tiffRepresentation,
@@ -1600,11 +1718,7 @@ struct WalletCardView: View {
                                let pngData = rep.representation(using: .png, properties: [:]) {
                                 try? pngData.write(to: tempURL)
                             }
-                            Task { @MainActor in
-                                card.customImageURL = tempURL
-                                card.customImage = img
-                                card.isSelected = true
-                            }
+                            Task { @MainActor in onDropImage(tempURL) }
                         }
                     }
                     return true
@@ -1613,56 +1727,79 @@ struct WalletCardView: View {
             }
             
             // Bottom Info & Controls
-            HStack(spacing: 8) {
-                Toggle("", isOn: $card.isSelected)
-                    .labelsHidden()
-                    .help("Include in flash")
-                
-                Text("Card #\(cardIndex + 1)")
-                    .font(.system(size: 12, weight: .semibold))
-                
-                // Monospace Hash Pill with Copy
-                HStack(spacing: 4) {
-                    Text(card.id.prefix(8) + "…" + card.id.suffix(6))
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(.secondary)
+            VStack(spacing: 6) {
+                HStack(spacing: 8) {
+                    Toggle("", isOn: $card.isSelected)
+                        .labelsHidden()
+                        .help("纳入本次刷写")
                     
-                    Button(action: {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(card.id, forType: .string)
-                        copied = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
-                    }) {
-                        Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                            .font(.system(size: 9))
-                            .foregroundColor(copied ? .green : .secondary)
+                    TextField("给这张卡起个名字", text: $nicknameDraft)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 12, weight: .semibold))
+                        .onSubmit { commitNickname() }
+                    
+                    Spacer(minLength: 0)
+                    
+                    if card.customImage != nil {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                            .font(.system(size: 12))
+                            .help("已分配卡面，可刷写")
+                    }
+                    
+                    Button(action: onShowHistory) {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary.opacity(0.8))
                     }
                     .buttonStyle(.plain)
-                    .help(copied ? "Copied!" : "Copy full hash")
+                    .help("应用记录 / 回滚")
+                    
+                    Button(action: onDelete) {
+                        Image(systemName: "trash")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary.opacity(0.7))
+                    }
+                    .buttonStyle(.plain)
+                    .help("从列表移除")
                 }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(Color(NSColor.controlBackgroundColor))
-                .cornerRadius(6)
+                .help("列表中的第 \(cardIndex + 1) 张卡")
                 
-                Spacer()
-                
-                // Status badge
-                if card.customImage != nil {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundColor(.green)
-                        .font(.system(size: 12))
-                        .help("Skin assigned and ready")
+                HStack(spacing: 6) {
+                    HStack(spacing: 4) {
+                        Text(card.id.prefix(8) + "…" + card.id.suffix(6))
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(.secondary)
+                        
+                        Button(action: {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(card.id, forType: .string)
+                            copied = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
+                        }) {
+                            Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                                .font(.system(size: 9))
+                                .foregroundColor(copied ? .green : .secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help(copied ? "已复制完整 hash" : "复制完整 hash")
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(6)
+                    
+                    Text(skinLabel)
+                        .font(.system(size: 10))
+                        .foregroundColor(card.skinId == nil ? .secondary.opacity(0.8) : .primary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    
+                    Spacer(minLength: 0)
+                    
+                    Button("换卡面") { onPickImage() }
+                        .controlSize(.mini)
                 }
-                
-                // Delete button
-                Button(action: onDelete) {
-                    Image(systemName: "trash")
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary.opacity(0.7))
-                }
-                .buttonStyle(.plain)
-                .help("Remove from list")
             }
             .padding(.horizontal, 4)
         }
@@ -1687,6 +1824,8 @@ struct ContentView: View {
     @State private var dragKeyStartOffsets: [String: CGPoint] = [:]
     @State private var isTargetedPoster = false
     @State private var isTargetedTheme = false
+    @State private var libraryPickerTarget: CardIdTarget?
+    @State private var historyTarget: CardIdTarget?
     
     private var readyToFlashCount: Int {
         vm.cards.filter { $0.isSelected && $0.customImageURL != nil }.count
@@ -1704,18 +1843,21 @@ struct ContentView: View {
             Divider()
             
             // 2. Control Toolbar (Unified across tabs to prevent resizing/jumping)
-            Group {
-                if vm.selectedTab == .walletCards {
-                    toolbarView
-                } else {
-                    passcodeToolbarView
+            // 卡面库自带工具栏，公共那一行直接收起。
+            if vm.selectedTab != .skinLibrary {
+                Group {
+                    if vm.selectedTab == .walletCards {
+                        toolbarView
+                    } else {
+                        passcodeToolbarView
+                    }
                 }
+                .frame(height: 48)
+                .padding(.horizontal, 20)
+                .background(Color(NSColor.windowBackgroundColor))
+                
+                Divider()
             }
-            .frame(height: 48)
-            .padding(.horizontal, 20)
-            .background(Color(NSColor.windowBackgroundColor))
-            
-            Divider()
             
             // 3. Live Scanner Notice Banner (if active)
             if vm.selectedTab == .walletCards && vm.isScanningCards {
@@ -1724,7 +1866,12 @@ struct ContentView: View {
             }
             
             // 4. Main Workspace
-            if vm.selectedTab == .walletCards {
+            if vm.selectedTab == .skinLibrary {
+                SkinLibraryView(store: vm.manager) { asset, hashes in
+                    for hash in hashes { vm.assignSkin(asset.id, to: hash) }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if vm.selectedTab == .walletCards {
                 ScrollView {
                     if vm.cards.isEmpty {
                         emptyStateView
@@ -1738,9 +1885,11 @@ struct ContentView: View {
                                 WalletCardView(
                                     card: $vm.cards[idx],
                                     cardIndex: idx,
-                                    onPickImage: { openCardImagePicker(for: vm.cards[idx].id) },
+                                    onPickImage: { libraryPickerTarget = CardIdTarget(id: vm.cards[idx].id) },
                                     onClearImage: { vm.clearCardImage(for: vm.cards[idx].id) },
-                                    onDelete: { vm.deleteCard(id: vm.cards[idx].id) }
+                                    onDelete: { vm.deleteCard(id: vm.cards[idx].id) },
+                                    onDropImage: { vm.setCardImage(for: vm.cards[idx].id, url: $0) },
+                                    onShowHistory: { historyTarget = CardIdTarget(id: vm.cards[idx].id) }
                                 )
                             }
                         }
@@ -1783,6 +1932,17 @@ struct ContentView: View {
         .sheet(isPresented: $vm.showAddCardSheet) {
             addCardSheet
         }
+        .sheet(item: $libraryPickerTarget) { target in
+            SkinPickerSheet(store: vm.manager,
+                            currentSkinId: vm.cards.first(where: { $0.id == target.id })?.skinId,
+                            onChoose: { vm.assignSkin($0, to: target.id) },
+                            onImportNew: { openCardImagePicker(for: target.id) })
+        }
+        .sheet(item: $historyTarget) { target in
+            CardHistoryPopover(store: vm.manager,
+                               cardHash: target.id,
+                               onReflash: { asset in vm.rollbackCard(target.id, to: asset) })
+        }
         .onChange(of: vm.selectedTab) { _, newTab in
             if newTab == .passcodeThemes && vm.isScanningCards {
                 vm.stopCardScanning()
@@ -1803,10 +1963,10 @@ struct ContentView: View {
             
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text("AirCard")
+                    Text("AirCard Manager")
                         .font(.title2)
                         .fontWeight(.bold)
-                    Text("v1.2.4")
+                    Text("v0.1.0")
                         .font(.system(size: 10, weight: .bold, design: .rounded))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
@@ -1814,7 +1974,7 @@ struct ContentView: View {
                         .foregroundColor(.accentColor)
                         .clipShape(Capsule())
                 }
-                Text("Wallet Cards & Passcode Themes")
+                Text("卡面管理端 · 上游 AirCard 1.2.4")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -1829,7 +1989,7 @@ struct ContentView: View {
             }
             .pickerStyle(.segmented)
             .controlSize(.regular)
-            .frame(width: 290)
+            .frame(width: 386)
             
             Spacer()
             
